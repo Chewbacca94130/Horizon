@@ -28,6 +28,41 @@ def guess_mime_type(name: str) -> str:
     return mime or "application/octet-stream"
 
 
+#: Pastille d'une pièce jointe (aperçu markdown) : couleur par famille d'extension. Même
+#: palette que BADGE_COLORS dans web/src/wysiwyg.js (cartes des notes WYSIWYG).
+_BADGE_COLORS = (
+    (frozenset({"pdf"}), "#d93025"),
+    (frozenset({"doc", "docx", "dot", "dotx", "rtf", "odt"}), "#2b579a"),
+    (frozenset({"xls", "xlsx", "xlsm", "csv", "ods"}), "#217346"),
+    (frozenset({"ppt", "pptx", "pot", "potx", "odp"}), "#d24726"),
+    (frozenset({"msg", "eml"}), "#0078d4"),
+    (frozenset({"zip", "7z", "rar", "gz", "tar"}), "#8a6d3b"),
+    (frozenset({"vsd", "vsdx"}), "#3955a3"),
+    (frozenset({"txt", "md", "log", "json", "xml", "yml", "yaml"}), "#5f6b7a"),
+)
+_DEFAULT_BADGE_COLOR = "#5f6b7a"
+
+
+def attachment_badge(name: str) -> tuple[str, str]:
+    """(libellé, couleur) de la pastille : l'extension en majuscules, 4 caractères au plus."""
+    ext = Path(name).suffix.lower().lstrip(".")
+    color = next((c for exts, c in _BADGE_COLORS if ext in exts), _DEFAULT_BADGE_COLOR)
+    return (ext.upper()[:4] or "?", color)
+
+
+def format_size(size: int) -> str:
+    if size <= 0:
+        return ""
+    value = float(size)
+    for unit in ("octets", "Ko", "Mo", "Go"):
+        if value < 1024 or unit == "Go":
+            break
+        value /= 1024
+    if unit == "octets":
+        return f"{size} octets"
+    return (f"{value:.1f}" if value < 10 else f"{value:.0f}").replace(".", ",") + f" {unit}"
+
+
 def safe_file_name(name: str, fallback: str = "piece-jointe") -> str:
     """Nom utilisable sur le disque : sans séparateur ni caractère interdit."""
     cleaned = _UNSAFE_NAME_RE.sub("_", name).strip(" .")

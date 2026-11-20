@@ -86,9 +86,10 @@ WYSIWYG specifics:
   `horizon-diagram://<id>`, served by `_DiagramSchemeHandler`. The editing view adds a
   `?v=<page nonce>.<revision>` cache buster that `refreshDiagram` bumps; the data view does not,
   so a refresh is never an edit. See docs/architecture.md, "Diagrams in WYSIWYG notes".
-- **Dropped files, e-mails and URLs are Python's.** `WebHtmlEditor` intercepts those drops
-  before Chromium; the page only places the caret (`setCaretAt`) and inserts the blocks Python
-  archived (`insertBlocks`) as `HorizonAttachment` widgets. See docs/architecture.md, "Dropped
-  content in WYSIWYG notes".
+- **Dropped files, e-mails and URLs are Python's.** `_WebEditorBase` intercepts those drops
+  before Chromium; the page only places the caret (`setCaretAt`, in both bundles) and inserts
+  what Python archived — `HorizonAttachment` widgets (`insertBlocks`) in CKEditor, markdown
+  links (`insertBlock`, then `replaceFirst` for a fetched page title) in CodeMirror. See
+  docs/architecture.md, "Dropped content in notes".
 - **The page never navigates.** Ctrl+click on a link in the text, or a click on the link in
   CKEditor's balloon, is sent to Python through `open_link`.

@@ -168,6 +168,33 @@ class ImportResult:
     titles_to_fetch: list[tuple[str, str]] = field(default_factory=list)  # (url, titre provisoire)
 
 
+def markdown_link(text: str, url: str) -> str:
+    """`[texte](url)` ; crochets du texte échappés, URL entre chevrons si elle contient
+    des espaces ou des parenthèses (CommonMark)."""
+    label = text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]").replace("\n", " ")
+    if any(c in url for c in " ()<>"):
+        url = "<" + url.replace("<", "%3C").replace(">", "%3E") + ">"
+    return f"[{label}]({url})"
+
+
+def blocks_to_markdown(blocks: list[dict]) -> str:
+    """Les blocs d'un dépôt en markdown, un par ligne. Une pièce jointe devient un lien
+    `horizon-attachment://<id>`, que l'aperçu affiche comme une icône du fichier."""
+    lines = []
+    for block in blocks:
+        kind = block["kind"]
+        if kind == "image":
+            lines.append(f"![](horizon-image://{block['imageId']})")
+        elif kind == "link":
+            lines.append(markdown_link(block["title"], block["href"]))
+        else:
+            label = block.get("subject") if kind == "email" else block["name"]
+            lines.append(markdown_link(label or block["name"], f"horizon-attachment://{block['attachmentId']}"))
+    # Une ligne vide entre deux blocs : en markdown, des lignes consécutives forment un
+    # seul paragraphe.
+    return "\n\n".join(lines)
+
+
 def host_title(url: str) -> str:
     host = urlsplit(url).hostname or url
     return host.removeprefix("www.")

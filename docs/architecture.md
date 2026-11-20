@@ -281,12 +281,12 @@ diagram shows its `alt` text.
   `MainWindow` calls `refresh_diagram(id)` on the main note panel and every note window; the page
   bumps the revision and reconverts the widgets — not an edit, the stored HTML is unchanged.
 
-### Dropped content in WYSIWYG notes
+### Dropped content in notes
 
-Files, Outlook e-mails and URLs dropped on a WYSIWYG note are archived and shown OneNote-style.
-Markdown notes keep the editor's default behaviour.
+Files, Outlook e-mails and URLs dropped on a note are archived and shown OneNote-style in a
+WYSIWYG note, as links in a markdown note (see *Markdown notes* at the end of this section).
 
-- **Interception.** `WebHtmlEditor` filters the drag events of its `QWebEngineView` (and of the
+- **Interception.** `_WebEditorBase` (both editors, `accept_drops`) filters the drag events of its `QWebEngineView` (and of the
   render widget QtWebEngine creates inside it) before Chromium sees them: Chromium cannot read
   Outlook's virtual files. `parse_drop` ([../src/horizon/attachment_drop.py](../src/horizon/attachment_drop.py))
   decides on `DragEnter` whether the drop is ours; text, HTML, an image from a web page and drags
@@ -315,6 +315,15 @@ Markdown notes keep the editor's default behaviour.
 - **Link titles.** The browser's title (`text/x-moz-url`, HTML anchor) is used when present;
   otherwise the card shows the host and `fetch_page_title` fetches `<title>` in a background thread,
   then `setLinkTitle` updates cards still showing the placeholder.
+
+- **Markdown notes.** The same import runs; `blocks_to_markdown` writes one paragraph per item at
+  the end of the line where it fell (never inside a word): `[name](horizon-attachment://N)` for a
+  file, `[subject](horizon-attachment://N)` for an e-mail, `![](horizon-image://N)` for an image,
+  `[title](url)` for a URL. The preview renders each `horizon-attachment://` link as an icon card
+  (type badge, name, size — `_attachment_card` in
+  [../src/horizon/widgets/markdown.py](../src/horizon/widgets/markdown.py)); a click opens the file.
+  Converting the note to WYSIWYG keeps these as plain links (`horizon-attachment` is an allowed
+  CKEditor link protocol), opened by Ctrl+click.
 
 Attachments are not deleted when their block is removed: note versions may still reference them.
 

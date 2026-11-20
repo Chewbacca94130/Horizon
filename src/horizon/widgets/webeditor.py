@@ -592,6 +592,9 @@ class _WebEditorBase(QWidget):
     image_upload      = Signal(bool)  # True = started, False = finished
     editor_ready      = Signal()      # the JS editor is live; call_js() lands from here on
     link_clicked      = Signal(str)   # WYSIWYG only: Ctrl+click on a link
+    content_dropped   = Signal(object)  # list[DroppedItem], after the drop returned
+
+    _DRAG_EVENTS = (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.DragLeave, QEvent.Type.Drop)
 
     def __init__(
         self,
@@ -600,9 +603,18 @@ class _WebEditorBase(QWidget):
         *,
         placeholder: str = "",
         prefs=None,
+        accept_drops: bool = False,
     ) -> None:
+        """`accept_drops`: files, Outlook e-mails and URLs dropped on the editor are
+        intercepted before Chromium sees them — Chromium cannot read Outlook's virtual
+        files, and the content must be archived by Python anyway. `content_dropped`
+        carries what `parse_drop` read; the owner archives it and inserts the result.
+        Everything else (text, HTML, an image from a web page, a drag inside the
+        editor) is left to the JavaScript editor."""
         super().__init__(parent)
         self._prefs = prefs
+        self._accepts_drops = accept_drops
+        self._drag_is_ours = False
         self._ready = False
         self._js_dirty = False
         self._flushing = False
@@ -649,6 +661,56 @@ class _WebEditorBase(QWidget):
         self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self._layout.addWidget(self._view, stretch=1)
         self._view.setHtml(self._page_html(), _RESOURCES_BASE_URL)
+        if self._accepts_drops:
+            self._watch_drops()
+
+    def _watch_drops(self) -> None:
+        # Qt delivers drag events to the view's render widget, a child created by
+        # QtWebEngine (sometimes after the page starts loading), or to the view itself:
+        # watch both.
+        self._view.installEventFilter(self)
+        for child in self._view.findChildren(QWidget):
+            child.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.ChildAdded and obj is self._view and event.child().isWidgetType():
+            event.child().installEventFilter(self)
+        elif etype in self._DRAG_EVENTS:
+            return self._filter_drag(obj, event)
+        return super().eventFilter(obj, event)
+
+    def _filter_drag(self, obj, event) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.DragEnter:
+            # source() is set for a drag started inside Horizon — text or a block moved
+            # within the note: the JavaScript editor's.
+            self._drag_is_ours = (
+                event.source() is None and parse_drop(event.mimeData(), read_contents=False) is not None
+            )
+        if not self._drag_is_ours:
+            return False
+        if etype == QEvent.Type.DragLeave:
+            self._drag_is_ours = False
+            return True
+        if self._bridge.read_only():
+            event.ignore()
+            return True
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        if etype == QEvent.Type.Drop:
+            self._drag_is_ours = False
+            # The QMimeData of an external drag dies with the event: read it now.
+            items = parse_drop(event.mimeData())
+            pos = event.position().toPoint()
+            if obj is not self._view:
+                pos = obj.mapTo(self._view, pos)
+            if items:
+                self.call_js("setCaretAt", pos.x(), pos.y())
+                # Archived once the drop has returned: Outlook is still inside its
+                # drag loop until then, and must not be called back by COM.
+                QTimer.singleShot(0, lambda: self.content_dropped.emit(items))
+        return True
 
     def showEvent(self, event) -> None:
         self._ensure_view()
@@ -756,8 +818,10 @@ class WebMarkdownEditor(_WebEditorBase):
         show_toolbar: bool = False,
         placeholder: str = "",
         prefs=None,
+        accept_drops: bool = False,
     ) -> None:
-        super().__init__(image_repo, parent, placeholder=placeholder, prefs=prefs)
+        super().__init__(image_repo, parent, placeholder=placeholder, prefs=prefs,
+                         accept_drops=accept_drops)
         self._toolbar = _WebMarkdownToolbar(self, self) if show_toolbar else None
         if self._toolbar is not None:
             self._layout.addWidget(self._toolbar)
@@ -770,6 +834,17 @@ class WebMarkdownEditor(_WebEditorBase):
         if self._toolbar is not None:
             self._toolbar.setEnabled(not read_only)
 
+    def insert_markdown(self, text: str) -> None:
+        """Insert dropped content, already written as markdown, as its own paragraph at
+        the caret — which the drop moved to the end of the line where the items fell."""
+        if text:
+            self.call_js("insertBlock", f"\n{text}\n")
+
+    def replace_first(self, old: str, new: str) -> None:
+        """Replace the first occurrence of `old` (a link title fetched after the drop);
+        nothing happens if the user already changed it."""
+        self.call_js("replaceFirst", old, new)
+
 
 class WebHtmlEditor(_WebEditorBase):
     """CKEditor 5 editing the HTML body of a WYSIWYG note.
@@ -781,21 +856,15 @@ class WebHtmlEditor(_WebEditorBase):
     data-diagram-id="…">`) and shown through horizon-diagram://, so a note always shows
     the diagram as it is now.
 
-    Files, Outlook e-mails and URLs dropped on the editor are intercepted here, before
-    Chromium sees them: Chromium cannot read Outlook's virtual files, and the content
-    must be archived by Python anyway. `content_dropped` carries what `parse_drop`
-    read; the owner archives it and calls `insert_blocks()`. Everything else (text,
-    HTML, an image from a web page, a drag inside the note) is left to CKEditor.
+    Dropped files, e-mails and URLs (see `_WebEditorBase`) are inserted by the owner
+    through `insert_blocks()`, as attachment widgets.
     """
 
     # Toolbar button: the owner picks a diagram, then calls insert_diagram().
     diagram_insert_requested = Signal()
     diagram_open_requested   = Signal(int)  # double-click on a diagram; emits diagram_id
-    content_dropped          = Signal(object)  # list[DroppedItem], after the drop returned
     attachment_open_requested = Signal(int)  # emits attachment_id
     attachment_save_requested = Signal(int)  # emits attachment_id
-
-    _DRAG_EVENTS = (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.DragLeave, QEvent.Type.Drop)
 
     def __init__(
         self,
@@ -808,7 +877,8 @@ class WebHtmlEditor(_WebEditorBase):
         placeholder: str = "",
         prefs=None,
     ) -> None:
-        super().__init__(image_repo, parent, placeholder=placeholder, prefs=prefs)
+        super().__init__(image_repo, parent, placeholder=placeholder, prefs=prefs,
+                         accept_drops=attachment_repo is not None)
         self._bridge.set_show_toolbar(show_toolbar)
         self._bridge.diagram_pick_pushed.connect(self.diagram_insert_requested)
         self._bridge.diagram_open_pushed.connect(self.diagram_open_requested)
@@ -816,64 +886,10 @@ class WebHtmlEditor(_WebEditorBase):
             _install_scheme_handler(IMAGE_SCHEME, lambda p: _ImageSchemeHandler(image_repo, p))
         if diagram_repo is not None:
             _install_scheme_handler(DIAGRAM_SCHEME, lambda p: _DiagramSchemeHandler(diagram_repo, p))
-        self._accepts_drops = attachment_repo is not None
         if attachment_repo is not None:
             _install_scheme_handler(ATTACHMENT_SCHEME, lambda p: _AttachmentSchemeHandler(attachment_repo, p))
         self._bridge.attachment_open_pushed.connect(self.attachment_open_requested)
         self._bridge.attachment_save_pushed.connect(self.attachment_save_requested)
-        self._drag_is_ours = False
-
-    def _ensure_view(self) -> None:
-        had_view = self._view is not None
-        super()._ensure_view()
-        if had_view or not self._accepts_drops:
-            return
-        # Qt delivers drag events to the view's render widget, a child created by
-        # QtWebEngine (sometimes after the page starts loading), or to the view itself:
-        # watch both.
-        self._view.installEventFilter(self)
-        for child in self._view.findChildren(QWidget):
-            child.installEventFilter(self)
-
-    def eventFilter(self, obj, event) -> bool:
-        etype = event.type()
-        if etype == QEvent.Type.ChildAdded and obj is self._view and event.child().isWidgetType():
-            event.child().installEventFilter(self)
-        elif etype in self._DRAG_EVENTS:
-            return self._filter_drag(obj, event)
-        return super().eventFilter(obj, event)
-
-    def _filter_drag(self, obj, event) -> bool:
-        etype = event.type()
-        if etype == QEvent.Type.DragEnter:
-            # source() is set for a drag started inside Horizon — a block moved within
-            # the note: CKEditor's.
-            self._drag_is_ours = (
-                event.source() is None and parse_drop(event.mimeData(), read_contents=False) is not None
-            )
-        if not self._drag_is_ours:
-            return False
-        if etype == QEvent.Type.DragLeave:
-            self._drag_is_ours = False
-            return True
-        if self._bridge.read_only():
-            event.ignore()
-            return True
-        event.setDropAction(Qt.DropAction.CopyAction)
-        event.accept()
-        if etype == QEvent.Type.Drop:
-            self._drag_is_ours = False
-            # The QMimeData of an external drag dies with the event: read it now.
-            items = parse_drop(event.mimeData())
-            pos = event.position().toPoint()
-            if obj is not self._view:
-                pos = obj.mapTo(self._view, pos)
-            if items:
-                self.call_js("setCaretAt", pos.x(), pos.y())
-                # Archived once the drop has returned: Outlook is still inside its
-                # drag loop until then, and must not be called back by COM.
-                QTimer.singleShot(0, lambda: self.content_dropped.emit(items))
-        return True
 
     def _page_html(self) -> str:
         return _make_wysiwyg_html()

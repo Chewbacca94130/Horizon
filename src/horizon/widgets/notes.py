@@ -32,7 +32,7 @@ from PySide6.QtWebChannel import QWebChannel
 
 from horizon import theme as _theme
 from horizon.attachment import AttachmentRepository
-from horizon.attachment_drop import DropImporter, fetch_page_title
+from horizon.attachment_drop import DropImporter, blocks_to_markdown, fetch_page_title, markdown_link
 from horizon.diagram import DiagramRepository
 from horizon.dialogs import ConfirmDialog, NoteFormatDialog, TaskDetailDialog
 from horizon.folder import FolderRepository
@@ -149,6 +149,13 @@ class NotesListWidget(QWidget):
             self.note_edit_requested.emit(note_id)
         elif action == window_action:
             self.note_open_in_window_requested.emit(note_id)
+
+
+def _attachment_id_from_url(url: str) -> int | None:
+    """Id de horizon-attachment://<id>. Lu dans le texte, pas via QUrl, qui prend le
+    nombre pour une adresse IPv4."""
+    raw = url.removeprefix("horizon-attachment://").split("?", 1)[0].strip("/")
+    return int(raw) if raw.isdigit() else None
 
 
 class _PageTitleFetcher(QObject):
@@ -332,6 +339,7 @@ class NoteDetailWidget(QWidget):
             show_toolbar=not sticky,
             placeholder="Notes de réunion…" if sticky else "Write markdown here…",
             prefs=prefs,
+            accept_drops=attachment_repo is not None,
         )
         self._html_editor = WebHtmlEditor(
             image_repo, self,
@@ -350,10 +358,11 @@ class NoteDetailWidget(QWidget):
         self._html_editor.link_clicked.connect(self._on_link_clicked)
         self._html_editor.diagram_insert_requested.connect(self._on_insert_diagram)
         self._html_editor.diagram_open_requested.connect(self.diagram_open_requested)
+        self._md_editor.content_dropped.connect(self._on_content_dropped)
         self._html_editor.content_dropped.connect(self._on_content_dropped)
         self._html_editor.attachment_open_requested.connect(self._on_open_attachment)
         self._html_editor.attachment_save_requested.connect(self._on_save_attachment)
-        self._title_fetcher.title_found.connect(self._html_editor.set_link_title)
+        self._title_fetcher.title_found.connect(self._on_page_title_found)
         self._editor_stack = QStackedWidget(self)
         self._editor_stack.addWidget(self._md_editor)
         self._editor_stack.addWidget(self._html_editor)
@@ -685,6 +694,7 @@ class NoteDetailWidget(QWidget):
             id_exists=self._note_id_exists,
             image_cache=self._image_cache,
             task_info=self._task_info,
+            attachment_repo=self._attachment_repo,
         ))
 
     def _on_image_clicked(self, data_uri: str) -> None:
@@ -709,14 +719,18 @@ class NoteDetailWidget(QWidget):
         self._status_clear_timer.start(timeout_ms)
 
     def _on_content_dropped(self, items: list) -> None:
-        """Archive what was dropped on the WYSIWYG editor and insert it where it fell."""
+        """Archive what was dropped on the editor and insert it where it fell: attachment
+        widgets in a WYSIWYG note, horizon-attachment:// links in a markdown note."""
         if self._drop_importer is None or self._current_note is None or self._locked:
             return
         self._status_clear_timer.stop()
         self._status_label.setText("Import du contenu déposé…")
         self._status_label.repaint()  # Outlook peut prendre une seconde : montrer l'attente
         result = self._drop_importer.import_items(items, self._current_note.id)
-        self._html_editor.insert_blocks(result.blocks)
+        if self._is_html():
+            self._html_editor.insert_blocks(result.blocks)
+        else:
+            self._md_editor.insert_markdown(blocks_to_markdown(result.blocks))
         for url, placeholder in result.titles_to_fetch:
             self._title_fetcher.fetch(url, placeholder)
         if result.errors:
@@ -724,6 +738,12 @@ class NoteDetailWidget(QWidget):
         else:
             count = len(result.blocks)
             self._show_status(f"{count} élément{'s' if count > 1 else ''} ajouté{'s' if count > 1 else ''}")
+
+    def _on_page_title_found(self, url: str, placeholder: str, title: str) -> None:
+        if self._is_html():
+            self._html_editor.set_link_title(url, placeholder, title)
+        else:
+            self._md_editor.replace_first(markdown_link(placeholder, url), markdown_link(title, url))
 
     def _on_open_attachment(self, attachment_id: int) -> None:
         if self._attachment_repo is None:
@@ -766,6 +786,12 @@ class NoteDetailWidget(QWidget):
             except ValueError:
                 return
             self.note_link_clicked.emit(note_id)
+            return
+        if parsed.scheme() == "horizon-attachment":
+            # Aperçu markdown (icône) ou lien d'une note convertie en WYSIWYG.
+            attachment_id = _attachment_id_from_url(url)
+            if attachment_id is not None:
+                self._on_open_attachment(attachment_id)
             return
         if parsed.scheme() == "horizon" and parsed.host() == "task":
             try:
@@ -950,7 +976,8 @@ class NoteDetailWidget(QWidget):
         if not self._is_html():
             self._editor.set_text(body)
             self._bridge.push_html(_markdown_to_html(
-                body, self._image_repo, self._note_repo, task_info=self._task_info))
+                body, self._image_repo, self._note_repo, task_info=self._task_info,
+                attachment_repo=self._attachment_repo))
             return
         if fmt is NoteFormat.Markdown:
             body = markdown_to_storage_html(

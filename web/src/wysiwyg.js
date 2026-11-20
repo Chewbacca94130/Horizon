@@ -700,7 +700,7 @@ function createEditor(state) {
     // allowedProtocols replaces CKEditor's list rather than extending it: the usual web
     // protocols must be restated, or their links are rendered with href="#" in the editor.
     link: {
-      allowedProtocols: ["https", "http", "ftp", "ftps", "mailto", "tel", "horizon"],
+      allowedProtocols: ["https", "http", "ftp", "ftps", "mailto", "tel", "horizon", "horizon-attachment"],
       defaultProtocol: "https://",
     },
     // Block alignment: tables through the table properties balloon (alignment, plus
