@@ -291,6 +291,31 @@ function formatSize(bytes) {
   return (unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)).toString().replace(".", ",") + " " + units[unit];
 }
 
+// A link to the original: a file or folder (file://), an Outlook e-mail (outlook:), or
+// a web page. The first two carry the original's name, which gives the badge.
+function linkTarget(href) {
+  if (/^file:/i.test(href)) {
+    try {
+      // file:///C:/x → C:\x ; file://serveur/partage → \\serveur\partage
+      return decodeURI(href.replace(/^file:\/*/i, (m) => (m.length > 7 ? "" : "\\\\"))).replace(/\//g, "\\");
+    } catch (e) {
+      return href;
+    }
+  }
+  if (/^outlook:/i.test(href)) return "Courriel Outlook — lien vers l'original";
+  return href;
+}
+
+function isFileLink(attrs) {
+  return attrs.kind === "link" && /^file:/i.test(attrs.href || "");
+}
+
+// Hover text of a card: the full path of a linked file or folder, then how to open it.
+function attachmentTooltip(attrs) {
+  if (isFileLink(attrs)) return linkTarget(attrs.href) + "\nDouble-cliquer pour ouvrir";
+  return attrs.kind === "link" ? "Double-cliquer pour ouvrir le lien" : "Double-cliquer pour ouvrir";
+}
+
 function attachmentHost(href) {
   try {
     return new URL(href).hostname.replace(/^www\./, "");
@@ -317,7 +342,11 @@ function badge(label, color) {
 }
 
 function attachmentBadge(attrs) {
-  if (attrs.kind === "link") return badge("WEB", "var(--hz-accent-color)");
+  if (attrs.kind === "link") {
+    if (attrs.mime === "inode/directory") return badge("DOS", "#c79a2b");
+    if (/^outlook:/i.test(attrs.href)) return badge("MSG", "#0078d4");
+    if (!attrs.name) return badge("WEB", "var(--hz-accent-color)");
+  }
   if (attrs.kind === "email") return badge((attachmentExtension(attrs.name) || "msg").toUpperCase(), "#0078d4");
   const ext = attachmentExtension(attrs.name);
   const color = (BADGE_COLORS.find(([re]) => re.test(ext)) || [null, "#5f6b7a"])[1];
@@ -335,7 +364,10 @@ function renderAttachment(dom, attrs) {
   let sub;
   if (attrs.kind === "link") {
     main = attrs.title || attachmentHost(attrs.href);
-    sub = attrs.href;
+    // A file or folder link shows its name only; the path is in the tooltip.
+    if (isFileLink(attrs)) sub = "";
+    else if (attrs.sender || attrs.date) sub = [attrs.sender, attrs.date].filter(Boolean).join(" · ");
+    else sub = linkTarget(attrs.href);
   } else if (attrs.kind === "email") {
     main = attrs.subject || attrs.name;
     sub = [attrs.sender, attrs.date].filter(Boolean).join(" · ");
@@ -512,7 +544,7 @@ function HorizonAttachment(ed) {
         {
           class: "horizon-attachment hz-att-" + attrs.kind + (attrs.display === "preview" && canPreview(attrs) ? " hz-att-preview" : ""),
           "data-attachment-id": String(attrs.attachmentId || ""),
-          title: attrs.kind === "link" ? "Double-cliquer pour ouvrir le lien" : "Double-cliquer pour ouvrir",
+          title: attachmentTooltip(attrs),
         },
         [writer.createRawElement("div", { class: "hz-att-body" }, (dom) => renderAttachment(dom, attrs))]
       );
@@ -700,7 +732,7 @@ function createEditor(state) {
     // allowedProtocols replaces CKEditor's list rather than extending it: the usual web
     // protocols must be restated, or their links are rendered with href="#" in the editor.
     link: {
-      allowedProtocols: ["https", "http", "ftp", "ftps", "mailto", "tel", "horizon", "horizon-attachment"],
+      allowedProtocols: ["https", "http", "ftp", "ftps", "mailto", "tel", "horizon", "horizon-attachment", "file", "outlook"],
       defaultProtocol: "https://",
     },
     // Block alignment: tables through the table properties balloon (alignment, plus

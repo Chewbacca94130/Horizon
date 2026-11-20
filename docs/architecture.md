@@ -294,6 +294,16 @@ WYSIWYG note, as links in a markdown note (see *Markdown notes* at the end of th
   at once (it dies with the event), the page moves the caret under the cursor (`setCaretAt`), and
   `content_dropped` is emitted **after** the drop returns — Outlook is still in its `DoDragDrop`
   loop until then and must not be called back over COM.
+- **Copy or link.** Every drop opens a menu under the cursor (`NoteDetailWidget._ask_drop_mode`):
+  *Copier le document dans Horizon* (`DropMode.COPY`) or *Créer un lien vers le document d'origine*
+  (`DropMode.LINK`); Escape or a click elsewhere cancels the drop. A link is a `kind="link"` block
+  (a `[name](url)` link in markdown) pointing to the original: `file:///…` for a file or folder
+  (`file://server/share/…` on a network share), `outlook:<EntryID>?store=<StoreID>` for an Outlook
+  e-mail — opened over COM with `GetItemFromID(…).Display()`, Outlook launched if needed — or the
+  URL itself. A file link is checked on click ("Document introuvable"), never while rendering: an
+  offline share would freeze every render. Attachments dragged out of an e-mail can only be copied.
+  Copying a URL downloads it in a background thread (`download_url`, same 200 MB cap); a document
+  URL answered by an HTML page (a sign-in page) is refused rather than archived.
 - **Archiving.** `DropImporter` stores files in `attachments` (BLOB, max 200 MB,
   [../src/horizon/attachment.py](../src/horizon/attachment.py)); `.png/.jpg/.gif/.webp` go to
   `images` and become ordinary images. E-mails dragged from Outlook only announce names

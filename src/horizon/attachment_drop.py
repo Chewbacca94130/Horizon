@@ -1,4 +1,4 @@
-"""Contenu déposé dans une note WYSIWYG : fichiers, courriels Outlook, URLs.
+"""Contenu déposé dans une note : fichiers, courriels Outlook, URLs.
 
 Deux temps, imposés par le glisser-déposer Windows :
 
@@ -9,26 +9,34 @@ Deux temps, imposés par le glisser-déposer Windows :
    DoDragDrop tant que le dépôt n'est pas terminé, et l'interroger par COM à ce
    moment-là peut bloquer les deux applications.
 
+Chaque dépôt est soit **copié** dans Horizon (`DropMode.COPY` : fichier archivé, URL
+téléchargée), soit **lié** à son original (`DropMode.LINK` : lien file://, lien vers le
+courriel dans Outlook, lien web).
+
 Les blocs sont des dictionnaires prêts pour le plugin `HorizonAttachment` de
-`web/src/wysiwyg.js` (clés en camelCase).
+`web/src/wysiwyg.js` (clés en camelCase), ou pour `blocks_to_markdown`.
 """
 
 import email
 import email.policy
 import html as _html
+import mimetypes
 import re
 import ssl
 import struct
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from enum import Enum
+from email.message import Message
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import certifi
 import httpx
+from PySide6.QtCore import QUrl
 
-from horizon.attachment import AttachmentRepository, guess_mime_type, safe_file_name
+from horizon.attachment import MAX_ATTACHMENT_BYTES, AttachmentRepository, guess_mime_type, safe_file_name
 from horizon.attachment_preview import pdf_page_count
 from horizon.document import extract_document_link
 from horizon.image import ImageRepository
@@ -52,6 +60,15 @@ _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _OL_EXPLORER = 34  # OlObjectClass.olExplorer
 _OL_INSPECTOR = 35  # OlObjectClass.olInspector
 _OL_MSG_UNICODE = 9  # OlSaveAsType.olMSGUnicode
+
+
+#: Schéma des liens vers un élément d'Outlook : outlook:<EntryID>?store=<StoreID>.
+OUTLOOK_SCHEME = "outlook:"
+
+
+class DropMode(Enum):
+    COPY = "copy"  # une copie du document est archivée dans Horizon
+    LINK = "link"  # un lien vers le document d'origine
 
 
 class DropImportError(Exception):
@@ -161,11 +178,21 @@ def _link_title(mime, url: str) -> str:
 # ── Archivage ─────────────────────────────────────────────────────────────────
 
 
+def link_unavailable_reason(items: list[DroppedItem]) -> str | None:
+    """Pourquoi ce dépôt ne peut pas être lié à son original, ou None s'il le peut. Une
+    pièce jointe glissée depuis un courriel n'existe que dans ce courriel."""
+    for item in items:
+        if isinstance(item, DroppedOutlookItems) and any(not n.lower().endswith(".msg") for n in item.names):
+            return "une pièce jointe de courriel n'existe que dans Outlook"
+    return None
+
+
 @dataclass
 class ImportResult:
     blocks: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     titles_to_fetch: list[tuple[str, str]] = field(default_factory=list)  # (url, titre provisoire)
+    downloads: list[str] = field(default_factory=list)  # URLs à copier : téléchargées hors du thread UI
 
 
 def markdown_link(text: str, url: str) -> str:
@@ -223,18 +250,27 @@ class DropImporter:
         self._attachment_repo = attachment_repo
         self._image_repo = image_repo
 
-    def import_items(self, items: list[DroppedItem], note_id: int | None) -> ImportResult:
+    def import_items(
+        self, items: list[DroppedItem], note_id: int | None, mode: DropMode = DropMode.COPY,
+    ) -> ImportResult:
         result = ImportResult()
+        link = mode is DropMode.LINK
         for item in items:
             try:
                 if isinstance(item, DroppedFile):
-                    result.blocks.append(self._import_file(item.path, note_id))
+                    result.blocks.append(
+                        _file_link_block(item.path) if link else self._import_file(item.path, note_id))
                 elif isinstance(item, DroppedLink):
+                    if not link:
+                        result.downloads.append(item.url)
+                        continue
                     title = item.title.strip()[:_TITLE_MAX]
                     if not title:
                         title = host_title(item.url)
                         result.titles_to_fetch.append((item.url, title))
                     result.blocks.append({"kind": "link", "href": item.url, "title": title})
+                elif link:
+                    result.blocks.extend(outlook_item_links(item.names))
                 else:
                     result.blocks.extend(self._import_outlook(item, note_id))
             except DropImportError as exc:
@@ -243,6 +279,10 @@ class DropImporter:
                 print(f"Horizon: drop import failed: {exc!r}", file=sys.stderr)
                 result.errors.append(f"Import impossible : {exc}")
         return result
+
+    def import_bytes(self, name: str, data: bytes, note_id: int | None) -> dict:
+        """Archive un contenu obtenu ailleurs (une URL téléchargée) et décrit son bloc."""
+        return self._block_for_bytes(name, data, note_id)
 
     # ── Fichiers ──────────────────────────────────────────────────────────
     def _import_file(self, path: Path, note_id: int | None) -> dict:
@@ -317,6 +357,135 @@ class DropImporter:
                 "Outlook n'a renvoyé aucun élément : sélectionnez le courriel dans Outlook puis glissez-le à nouveau."
             )
         return blocks
+
+
+# ── Liens vers l'original ─────────────────────────────────────────────────────
+
+
+def _file_link_block(path: Path) -> dict:
+    """Lien vers un fichier ou un dossier tel qu'il est sur le disque (ou le partage) :
+    rien n'est copié, la note suit l'original — et le perd s'il est déplacé."""
+    return {
+        "kind": "link",
+        "href": QUrl.fromLocalFile(str(path)).toString(QUrl.ComponentFormattingOption.FullyEncoded),
+        "title": path.name or str(path),
+        "name": path.name,
+        "mime": "inode/directory" if path.is_dir() else guess_mime_type(path.name),
+    }
+
+
+def outlook_item_links(names: list[str]) -> list[dict]:
+    """Liens vers les courriels sélectionnés dans Outlook (outlook:<EntryID>?store=…)."""
+    outlook = _outlook_application()
+    window = outlook.ActiveWindow()
+    if window is None or window.Class not in (_OL_EXPLORER, _OL_INSPECTOR):
+        raise DropImportError("Aucune fenêtre Outlook active : glissez le courriel depuis Outlook.")
+    blocks = []
+    for item in _selected_items(window):
+        meta = _item_metadata(item)
+        entry_id = getattr(item, "EntryID", "")
+        if meta is None or not entry_id:
+            continue
+        try:
+            store_id = item.Parent.StoreID
+        except Exception:
+            store_id = ""
+        href = OUTLOOK_SCHEME + entry_id + (f"?store={store_id}" if store_id else "")
+        subject = meta["subject"] or "Courriel"
+        blocks.append({
+            "kind": "link",
+            "href": href,
+            "title": subject,
+            "name": safe_file_name(subject) + ".msg",
+            "sender": meta["sender"],
+            "date": meta["date"],
+        })
+    if not blocks:
+        raise DropImportError(
+            "Outlook n'a renvoyé aucun courriel : sélectionnez-le dans Outlook puis glissez-le à nouveau."
+        )
+    return blocks
+
+
+def open_outlook_item(href: str) -> None:
+    """Ouvre dans Outlook le courriel d'un lien outlook:<EntryID>?store=<StoreID>. Lancé
+    au besoin : c'est un clic explicite, pas un dépôt."""
+    try:
+        import pythoncom
+        import pywintypes
+        import win32com.client
+    except ImportError as exc:
+        raise DropImportError("pywin32 n'est pas installé : ouverture Outlook indisponible.") from exc
+    raw = href.removeprefix(OUTLOOK_SCHEME)
+    entry_id, _, query = raw.partition("?")
+    store_id = parse_qs(query).get("store", [""])[0]
+    pythoncom.CoInitialize()
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        session = outlook.Session
+        item = session.GetItemFromID(entry_id, store_id) if store_id else session.GetItemFromID(entry_id)
+        item.Display()
+    except pywintypes.com_error as exc:
+        raise DropImportError(
+            "Courriel introuvable dans Outlook : il a peut-être été supprimé ou déplacé vers une autre boîte."
+        ) from exc
+
+
+# ── Copie d'une URL ───────────────────────────────────────────────────────────
+
+
+def _content_disposition_name(header: str) -> str:
+    if not header:
+        return ""
+    message = Message()
+    message["content-disposition"] = header
+    name = message.get_filename() or ""
+    return name.strip().strip('"')
+
+
+def download_url(url: str, timeout: float = 30.0) -> tuple[str, bytes]:
+    """Télécharge le document d'une URL : (nom de fichier, contenu). DropImportError si
+    le site refuse, demande une connexion ou dépasse la taille maximale.
+
+    Appelé hors du thread de l'interface ; n'écrit rien en base."""
+    context = ssl.create_default_context(cafile=certifi.where())
+    path_name = unquote(urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1])
+    try:
+        with httpx.Client(
+            verify=context, timeout=timeout, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Horizon"},
+        ) as client:
+            with client.stream("GET", url) as response:
+                if response.status_code >= 400:
+                    raise DropImportError(f"Téléchargement refusé par le site ({response.status_code}) : {url}")
+                content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+                # Un lien vers un document (SharePoint, OneDrive…) qui répond par une page
+                # HTML : c'est la page de connexion, pas le document.
+                if content_type == "text/html" and Path(path_name).suffix.lower() not in ("", ".html", ".htm", ".aspx", ".php"):
+                    raise DropImportError(
+                        "Le site demande une connexion : copie impossible, choisissez « Créer un lien »."
+                    )
+                chunks = []
+                size = 0
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > MAX_ATTACHMENT_BYTES:
+                        raise DropImportError(
+                            f"Document trop volumineux (plus de {MAX_ATTACHMENT_BYTES // (1024 * 1024)} Mo) : {url}")
+                    chunks.append(chunk)
+                name = _content_disposition_name(response.headers.get("content-disposition", ""))
+    except (httpx.HTTPError, ssl.SSLError, OSError) as exc:
+        raise DropImportError(f"Téléchargement impossible ({exc.__class__.__name__}) : {url}") from exc
+
+    name = safe_file_name(name or path_name or host_title(url))
+    # « python.org » n'a pas d'extension .org : seul le type annoncé fait foi quand le
+    # nom n'en a pas une reconnue.
+    if content_type == "text/html":
+        if Path(name).suffix.lower() not in (".html", ".htm"):
+            name += ".html"
+    elif mimetypes.guess_type(name)[0] is None:
+        name += mimetypes.guess_extension(content_type or "") or ""
+    return name, b"".join(chunks)
 
 
 # ── Courriels ─────────────────────────────────────────────────────────────────

@@ -58,6 +58,10 @@ _HTML_PH_RE = re.compile(r'HORIZONIMG(\d+)END')
 _MD_ATT_RE    = re.compile(r'(?<!!)\[((?:\\.|[^\]\\])*)\]\(horizon-attachment://(\d+)\)')
 _ATT_PH_RE    = re.compile(r'HORIZONATT(\d+)END')
 _MD_ESCAPE_RE = re.compile(r'\\(.)')
+# Lien vers le document d'origine : [nom](file:///…) ou [objet](outlook:<EntryID>…),
+# destination éventuellement entre chevrons (CommonMark, chemins avec espaces).
+_MD_ORIGIN_RE = re.compile(r'(?<!!)\[((?:\\.|[^\]\\])*)\]\(<?((?:file|outlook):[^)>\s]+)>?\)')
+_ORIGIN_PH_RE = re.compile(r'HORIZONORIGIN(\d+)END')
 
 _WIKILINK_RE = re.compile(
     r'\[\[(\d+)\|([^\]]+)\]\]'   # [[42|Texte]] : group 1=id, group 2=label
@@ -170,7 +174,7 @@ def _make_preview_html() -> str:
     font: bold 10px/40px 'Segoe UI', sans-serif; text-align: center; letter-spacing: 0.3px; }}
   .att-text {{ display: flex; flex-direction: column; min-width: 0; line-height: 1.35; }}
   .att-name {{ font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-  .att-sub {{ font-size: 0.85em; opacity: 0.7; white-space: nowrap; }}
+  .att-sub {{ font-size: 0.85em; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70ch; }}
   .att-missing {{ opacity: 0.5; text-decoration: line-through; font-style: italic; }}
 </style>
 <link rel="stylesheet" href="{_HIGHLIGHT_CSS_DARK_URL if t.is_dark else _HIGHLIGHT_CSS_LIGHT_URL}">
@@ -700,6 +704,14 @@ def _markdown_to_html(
 
         markdown = _MD_ATT_RE.sub(_extract_attachment, markdown)
 
+    origin_links: list[tuple[str, str]] = []
+
+    def _extract_origin(m: re.Match) -> str:
+        origin_links.append((m.group(2), _MD_ESCAPE_RE.sub(r'\1', m.group(1))))
+        return f"HORIZONORIGIN{len(origin_links) - 1}END"
+
+    markdown = _MD_ORIGIN_RE.sub(_extract_origin, markdown)
+
     markdown, html_blocks = _extract_html_blocks(markdown)
     markdown, inline_tags = _extract_tags(markdown)
     markdown, diagrams = _extract_mermaid(markdown)
@@ -737,10 +749,37 @@ def _markdown_to_html(
     if attachment_links:
         html = _ATT_PH_RE.sub(
             lambda m: _attachment_card(attachment_repo, *attachment_links[int(m.group(1))]), html)
+    if origin_links:
+        html = _ORIGIN_PH_RE.sub(lambda m: _origin_card(*origin_links[int(m.group(1))]), html)
 
     html = _inject_html_blocks(html, html_blocks)
 
     return html
+
+
+def _card_html(href: str, badge: str, color: str, name: str, sub: str, tooltip: str) -> str:
+    esc = _html_mod.escape
+    return (
+        f'<a class="att-card" href="{esc(href)}" title="{esc(tooltip)}">'
+        f'<span class="att-badge" style="background:{color}">{esc(badge)}</span>'
+        f'<span class="att-text"><span class="att-name">{esc(name)}</span>'
+        f'<span class="att-sub">{esc(sub)}</span></span></a>'
+    )
+
+
+def _origin_card(href: str, label: str) -> str:
+    """Icône d'un lien vers le document d'origine (fichier, dossier, courriel Outlook).
+    L'existence du fichier n'est pas vérifiée ici — un partage réseau hors ligne gèlerait
+    chaque rendu — mais au clic."""
+    if href.startswith("outlook:"):
+        return _card_html(href, "MSG", "#0078d4", label or "Courriel", "Courriel Outlook — lien vers l'original",
+                          "Ouvrir dans Outlook")
+    path = str(Path(QUrl(href).toLocalFile())) if QUrl(href).isLocalFile() else href
+    name = label or Path(path).name or path
+    badge, color = attachment_badge(Path(path).name)
+    if badge == "?":
+        badge, color = "DOS", "#c79a2b"  # sans extension : le plus souvent un dossier
+    return _card_html(href, badge, color, name, path, f"Ouvrir {path}")
 
 
 def _attachment_card(attachment_repo: AttachmentRepository, attachment_id: int, label: str) -> str:
