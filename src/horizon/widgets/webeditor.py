@@ -16,7 +16,9 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QEventLoop, QObject, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QBuffer, QByteArray, QEvent, QEventLoop, QObject, QSize, Qt, QTimer, QUrl, QUrlQuery, Signal, Slot,
+)
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import (
     QWebEnginePage,
@@ -29,6 +31,9 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
 from horizon import theme as _theme
+from horizon.attachment import AttachmentRepository
+from horizon.attachment_drop import parse_drop
+from horizon.attachment_preview import render_pdf_page
 from horizon.diagram import DiagramRepository
 from horizon.image import ImageRepository
 
@@ -46,16 +51,17 @@ _TOOLBAR_BUTTON_SIZE = QSize(26, 26)
 
 IMAGE_SCHEME   = b"horizon-image"
 DIAGRAM_SCHEME = b"horizon-diagram"
+ATTACHMENT_SCHEME = b"horizon-attachment"
 
 _PROFILE: QWebEngineProfile | None = None
 _SCHEME_HANDLERS: dict[bytes, QWebEngineUrlSchemeHandler] = {}
 
 
 def register_schemes() -> None:
-    """Declare horizon-image:// and horizon-diagram:// to Chromium. Qt requires this
-    before QApplication exists, hence a function called from __main__ rather than an
-    import-time side effect."""
-    for name in (IMAGE_SCHEME, DIAGRAM_SCHEME):
+    """Declare horizon-image://, horizon-diagram:// and horizon-attachment:// to
+    Chromium. Qt requires this before QApplication exists, hence a function called from
+    __main__ rather than an import-time side effect."""
+    for name in (IMAGE_SCHEME, DIAGRAM_SCHEME, ATTACHMENT_SCHEME):
         scheme = QWebEngineUrlScheme(name)
         # Path, not Host: with a host syntax Chromium reads the numeric id as an IPv4
         # address and requests horizon-image://0.0.0.12/.
@@ -144,6 +150,33 @@ class _DiagramSchemeHandler(QWebEngineUrlSchemeHandler):
             _reply(job, diagram.thumbnail, b"image/png")
         else:
             job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
+
+
+class _AttachmentSchemeHandler(QWebEngineUrlSchemeHandler):
+    """Serves horizon-attachment://<id>?page=<n>: page n of a PDF attachment, rendered
+    on demand (see attachment_preview). The bare URL serves the archived file itself."""
+
+    def __init__(self, attachment_repo: AttachmentRepository, parent=None) -> None:
+        super().__init__(parent)
+        self._attachment_repo = attachment_repo
+
+    def requestStarted(self, job: QWebEngineUrlRequestJob) -> None:
+        url = job.requestUrl()
+        attachment_id = _id_from_url(url)
+        data = self._attachment_repo.get_data(attachment_id) if attachment_id is not None else None
+        if data is None:
+            job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
+            return
+        page = QUrlQuery(url).queryItemValue("page")
+        if not page:
+            attachment = self._attachment_repo.get(attachment_id)
+            _reply(job, data, attachment.mime_type.encode("ascii", "replace"))
+            return
+        png = render_pdf_page(attachment_id, data, int(page)) if page.isdigit() else None
+        if png is None:
+            job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
+            return
+        _reply(job, png, b"image/png")
 
 
 def _install_scheme_handler(scheme: bytes, make_handler) -> None:
@@ -280,6 +313,23 @@ def _make_wysiwyg_html() -> str:
   /* Diagrammes draw.io : rendu SVG, aligné à gauche comme les images ; double-clic = éditeur. */
   .ck-content figure.horizon-diagram {{ display: table; margin: 0.9em auto 0.9em 0; min-width: 50px; cursor: default; }}
   .ck-content figure.horizon-diagram img {{ display: block; max-width: 100%; height: auto; }}
+  /* Pièces jointes déposées (fichiers, courriels, liens) : carte façon OneNote, aperçu en dessous. */
+  .ck-content figure.horizon-attachment {{ display: table; margin: 0.6em auto 0.6em 0; max-width: 100%; cursor: default; }}
+  .ck-content figure.horizon-attachment.hz-att-preview {{ display: block; margin-right: 0; }}
+  .ck-content .hz-att-card {{ display: inline-flex; align-items: center; gap: 10px; padding: 6px 12px 6px 6px;
+    border: 1px solid var(--hz-border); border-radius: 6px; background: var(--hz-surface-alt-bg); max-width: 100%; }}
+  .ck-content .hz-att-badge {{ flex: none; min-width: 34px; height: 40px; padding: 0 4px; border-radius: 4px; color: #fff;
+    font: bold 10px/40px 'Segoe UI', sans-serif; text-align: center; letter-spacing: 0.3px; }}
+  .ck-content .hz-att-text {{ min-width: 0; line-height: 1.35; }}
+  .ck-content .hz-att-name {{ font-weight: 600; color: var(--hz-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60ch; }}
+  .ck-content .hz-att-sub {{ font-size: 0.85em; opacity: 0.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70ch; }}
+  .ck-content .hz-att-link .hz-att-sub {{ color: {t.preview_link}; opacity: 1; }}
+  .ck-content .hz-att-excerpt {{ margin-top: 6px; padding: 8px 12px; border-left: 3px solid #0078d4; background: var(--hz-surface-alt-bg);
+    white-space: pre-wrap; font-size: 0.92em; max-height: 24em; overflow-y: auto; }}
+  .ck-content .hz-att-pages {{ display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }}
+  .ck-content .hz-att-page {{ display: block; width: 100%; max-width: 560px; height: auto; border: 1px solid var(--hz-border);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25); background: #fff; }}
+  .ck-content .hz-att-more {{ margin-top: 4px; font-size: 0.85em; opacity: 0.7; }}
 </style>
 </head>
 <body>
@@ -308,6 +358,8 @@ class _EditorBridge(QObject):
     link_pushed      = Signal(str)
     diagram_pick_pushed = Signal()
     diagram_open_pushed = Signal(int)
+    attachment_open_pushed = Signal(int)
+    attachment_save_pushed = Signal(int)
 
     def __init__(self, image_repo: ImageRepository | None, parent=None) -> None:
         super().__init__(parent)
@@ -345,6 +397,9 @@ class _EditorBridge(QObject):
 
     def set_read_only(self, read_only: bool) -> None:
         self._read_only = read_only
+
+    def read_only(self) -> bool:
+        return self._read_only
 
     def set_show_toolbar(self, show: bool) -> None:
         self._show_toolbar = show
@@ -419,6 +474,14 @@ class _EditorBridge(QObject):
     @Slot(int)
     def open_diagram(self, diagram_id: int) -> None:
         self.diagram_open_pushed.emit(diagram_id)
+
+    @Slot(int)
+    def open_attachment(self, attachment_id: int) -> None:
+        self.attachment_open_pushed.emit(attachment_id)
+
+    @Slot(int)
+    def save_attachment(self, attachment_id: int) -> None:
+        self.attachment_save_pushed.emit(attachment_id)
 
     @Slot(str, result=int)
     def store_image(self, data_url: str) -> int:
@@ -717,11 +780,22 @@ class WebHtmlEditor(_WebEditorBase):
     draw.io diagrams are embedded by reference (`<figure class="horizon-diagram"
     data-diagram-id="…">`) and shown through horizon-diagram://, so a note always shows
     the diagram as it is now.
+
+    Files, Outlook e-mails and URLs dropped on the editor are intercepted here, before
+    Chromium sees them: Chromium cannot read Outlook's virtual files, and the content
+    must be archived by Python anyway. `content_dropped` carries what `parse_drop`
+    read; the owner archives it and calls `insert_blocks()`. Everything else (text,
+    HTML, an image from a web page, a drag inside the note) is left to CKEditor.
     """
 
     # Toolbar button: the owner picks a diagram, then calls insert_diagram().
     diagram_insert_requested = Signal()
     diagram_open_requested   = Signal(int)  # double-click on a diagram; emits diagram_id
+    content_dropped          = Signal(object)  # list[DroppedItem], after the drop returned
+    attachment_open_requested = Signal(int)  # emits attachment_id
+    attachment_save_requested = Signal(int)  # emits attachment_id
+
+    _DRAG_EVENTS = (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.DragLeave, QEvent.Type.Drop)
 
     def __init__(
         self,
@@ -729,6 +803,7 @@ class WebHtmlEditor(_WebEditorBase):
         parent=None,
         *,
         diagram_repo: DiagramRepository | None = None,
+        attachment_repo: AttachmentRepository | None = None,
         show_toolbar: bool = True,
         placeholder: str = "",
         prefs=None,
@@ -741,6 +816,64 @@ class WebHtmlEditor(_WebEditorBase):
             _install_scheme_handler(IMAGE_SCHEME, lambda p: _ImageSchemeHandler(image_repo, p))
         if diagram_repo is not None:
             _install_scheme_handler(DIAGRAM_SCHEME, lambda p: _DiagramSchemeHandler(diagram_repo, p))
+        self._accepts_drops = attachment_repo is not None
+        if attachment_repo is not None:
+            _install_scheme_handler(ATTACHMENT_SCHEME, lambda p: _AttachmentSchemeHandler(attachment_repo, p))
+        self._bridge.attachment_open_pushed.connect(self.attachment_open_requested)
+        self._bridge.attachment_save_pushed.connect(self.attachment_save_requested)
+        self._drag_is_ours = False
+
+    def _ensure_view(self) -> None:
+        had_view = self._view is not None
+        super()._ensure_view()
+        if had_view or not self._accepts_drops:
+            return
+        # Qt delivers drag events to the view's render widget, a child created by
+        # QtWebEngine (sometimes after the page starts loading), or to the view itself:
+        # watch both.
+        self._view.installEventFilter(self)
+        for child in self._view.findChildren(QWidget):
+            child.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.ChildAdded and obj is self._view and event.child().isWidgetType():
+            event.child().installEventFilter(self)
+        elif etype in self._DRAG_EVENTS:
+            return self._filter_drag(obj, event)
+        return super().eventFilter(obj, event)
+
+    def _filter_drag(self, obj, event) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.DragEnter:
+            # source() is set for a drag started inside Horizon — a block moved within
+            # the note: CKEditor's.
+            self._drag_is_ours = (
+                event.source() is None and parse_drop(event.mimeData(), read_contents=False) is not None
+            )
+        if not self._drag_is_ours:
+            return False
+        if etype == QEvent.Type.DragLeave:
+            self._drag_is_ours = False
+            return True
+        if self._bridge.read_only():
+            event.ignore()
+            return True
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        if etype == QEvent.Type.Drop:
+            self._drag_is_ours = False
+            # The QMimeData of an external drag dies with the event: read it now.
+            items = parse_drop(event.mimeData())
+            pos = event.position().toPoint()
+            if obj is not self._view:
+                pos = obj.mapTo(self._view, pos)
+            if items:
+                self.call_js("setCaretAt", pos.x(), pos.y())
+                # Archived once the drop has returned: Outlook is still inside its
+                # drag loop until then, and must not be called back by COM.
+                QTimer.singleShot(0, lambda: self.content_dropped.emit(items))
+        return True
 
     def _page_html(self) -> str:
         return _make_wysiwyg_html()
@@ -754,6 +887,16 @@ class WebHtmlEditor(_WebEditorBase):
     def insert_diagram(self, diagram_id: int) -> None:
         """Insert a diagram at the caret — an edit like any other."""
         self.call_js("insertDiagram", diagram_id)
+
+    def insert_blocks(self, blocks: list[dict]) -> None:
+        """Insert dropped content (see attachment_drop.DropImporter) at the caret, which
+        the drop moved to where the items fell — an edit like any other."""
+        if blocks:
+            self.call_js("insertBlocks", blocks)
+
+    def set_link_title(self, href: str, placeholder: str, title: str) -> None:
+        """Give link cards still showing `placeholder` the page title fetched later."""
+        self.call_js("setLinkTitle", href, placeholder, title)
 
     def refresh_diagram(self, diagram_id: int) -> None:
         """Reload the rendering of a diagram that was redrawn or deleted. The page caches

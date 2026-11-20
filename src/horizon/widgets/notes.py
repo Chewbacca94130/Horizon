@@ -1,10 +1,14 @@
-from PySide6.QtCore import Qt, Signal, QTimer
+import threading
+from pathlib import Path
+
+from PySide6.QtCore import QObject, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -27,6 +31,8 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
 
 from horizon import theme as _theme
+from horizon.attachment import AttachmentRepository
+from horizon.attachment_drop import DropImporter, fetch_page_title
 from horizon.diagram import DiagramRepository
 from horizon.dialogs import ConfirmDialog, NoteFormatDialog, TaskDetailDialog
 from horizon.folder import FolderRepository
@@ -145,6 +151,23 @@ class NotesListWidget(QWidget):
             self.note_open_in_window_requested.emit(note_id)
 
 
+class _PageTitleFetcher(QObject):
+    """Cherche le titre des pages déposées sans en avoir, hors du thread de l'interface.
+
+    Le signal est émis depuis un thread Python : Qt le remet dans la file du thread de
+    ce QObject (celui de l'interface), où le slot s'exécute."""
+
+    title_found = Signal(str, str, str)  # emits (url, provisional title, fetched title)
+
+    def fetch(self, url: str, placeholder: str) -> None:
+        def run() -> None:
+            title = fetch_page_title(url)
+            if title and title != placeholder:
+                self.title_found.emit(url, placeholder, title)
+
+        threading.Thread(target=run, name="horizon-page-title", daemon=True).start()
+
+
 class NoteDetailWidget(QWidget):
     back_requested = Signal()
     note_link_clicked = Signal(int)  # emits note_id
@@ -154,7 +177,7 @@ class NoteDetailWidget(QWidget):
     editor_ready = Signal()  # CodeMirror is live; focus_editor() lands from here on
     diagram_open_requested = Signal(int)  # emits diagram_id (double-click on a diagram, WYSIWYG)
 
-    def __init__(self, note_repo: NoteRepository, project_repo: ProjectRepository, folder_repo: FolderRepository, prefs=None, image_repo: ImageRepository | None = None, version_repo: NoteVersionRepository | None = None, task_repo: TaskRepository | None = None, subtask_repo: SubtaskRepository | None = None, note_task_repo: NoteTaskRepository | None = None, diagram_repo: DiagramRepository | None = None, windowed: bool = False, sticky: bool = False, parent=None) -> None:
+    def __init__(self, note_repo: NoteRepository, project_repo: ProjectRepository, folder_repo: FolderRepository, prefs=None, image_repo: ImageRepository | None = None, version_repo: NoteVersionRepository | None = None, task_repo: TaskRepository | None = None, subtask_repo: SubtaskRepository | None = None, note_task_repo: NoteTaskRepository | None = None, diagram_repo: DiagramRepository | None = None, attachment_repo: AttachmentRepository | None = None, windowed: bool = False, sticky: bool = False, parent=None) -> None:
         super().__init__(parent)
         self._note_repo = note_repo
         self._project_repo = project_repo
@@ -162,6 +185,9 @@ class NoteDetailWidget(QWidget):
         self._prefs = prefs
         self._image_repo = image_repo
         self._diagram_repo = diagram_repo
+        self._attachment_repo = attachment_repo
+        self._drop_importer = DropImporter(attachment_repo, image_repo) if attachment_repo is not None else None
+        self._title_fetcher = _PageTitleFetcher(self)
         self._version_repo = version_repo
         self._task_repo = task_repo
         self._subtask_repo = subtask_repo
@@ -310,6 +336,7 @@ class NoteDetailWidget(QWidget):
         self._html_editor = WebHtmlEditor(
             image_repo, self,
             diagram_repo=diagram_repo,
+            attachment_repo=attachment_repo,
             show_toolbar=not sticky,
             placeholder="Notes de réunion…" if sticky else "Écrivez ici…",
             prefs=prefs,
@@ -323,6 +350,10 @@ class NoteDetailWidget(QWidget):
         self._html_editor.link_clicked.connect(self._on_link_clicked)
         self._html_editor.diagram_insert_requested.connect(self._on_insert_diagram)
         self._html_editor.diagram_open_requested.connect(self.diagram_open_requested)
+        self._html_editor.content_dropped.connect(self._on_content_dropped)
+        self._html_editor.attachment_open_requested.connect(self._on_open_attachment)
+        self._html_editor.attachment_save_requested.connect(self._on_save_attachment)
+        self._title_fetcher.title_found.connect(self._html_editor.set_link_title)
         self._editor_stack = QStackedWidget(self)
         self._editor_stack.addWidget(self._md_editor)
         self._editor_stack.addWidget(self._html_editor)
@@ -672,6 +703,55 @@ class NoteDetailWidget(QWidget):
         diagram_id = DiagramPickerDialog.ask(self._diagram_repo, self)
         if diagram_id is not None:
             self._html_editor.insert_diagram(diagram_id)
+
+    def _show_status(self, message: str, timeout_ms: int = 2000) -> None:
+        self._status_label.setText(message)
+        self._status_clear_timer.start(timeout_ms)
+
+    def _on_content_dropped(self, items: list) -> None:
+        """Archive what was dropped on the WYSIWYG editor and insert it where it fell."""
+        if self._drop_importer is None or self._current_note is None or self._locked:
+            return
+        self._status_clear_timer.stop()
+        self._status_label.setText("Import du contenu déposé…")
+        self._status_label.repaint()  # Outlook peut prendre une seconde : montrer l'attente
+        result = self._drop_importer.import_items(items, self._current_note.id)
+        self._html_editor.insert_blocks(result.blocks)
+        for url, placeholder in result.titles_to_fetch:
+            self._title_fetcher.fetch(url, placeholder)
+        if result.errors:
+            self._show_status(" — ".join(result.errors), 8000)
+        else:
+            count = len(result.blocks)
+            self._show_status(f"{count} élément{'s' if count > 1 else ''} ajouté{'s' if count > 1 else ''}")
+
+    def _on_open_attachment(self, attachment_id: int) -> None:
+        if self._attachment_repo is None:
+            return
+        path = self._attachment_repo.export_to_temp(attachment_id)
+        if path is None:
+            self._show_status("Pièce jointe introuvable dans la base", 5000)
+            return
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self._show_status(f"Aucune application pour ouvrir « {path.name} »", 5000)
+
+    def _on_save_attachment(self, attachment_id: int) -> None:
+        attachment = self._attachment_repo.get(attachment_id) if self._attachment_repo is not None else None
+        if attachment is None:
+            self._show_status("Pièce jointe introuvable dans la base", 5000)
+            return
+        default = str(Path.home() / "Downloads" / attachment.name)
+        target, _ = QFileDialog.getSaveFileName(self, "Enregistrer la pièce jointe", default)
+        if not target:
+            return
+        try:
+            self._attachment_repo.export_to(attachment_id, Path(target))
+        except OSError as exc:
+            self._show_status(f"Enregistrement impossible : {exc.strerror or exc}", 8000)
+            return
+        self._show_status(f"Enregistré : {Path(target).name}")
 
     def refresh_diagram(self, diagram_id: int) -> None:
         """Show the new rendering of a diagram that was redrawn or deleted."""

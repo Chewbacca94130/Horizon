@@ -281,6 +281,43 @@ diagram shows its `alt` text.
   `MainWindow` calls `refresh_diagram(id)` on the main note panel and every note window; the page
   bumps the revision and reconverts the widgets — not an edit, the stored HTML is unchanged.
 
+### Dropped content in WYSIWYG notes
+
+Files, Outlook e-mails and URLs dropped on a WYSIWYG note are archived and shown OneNote-style.
+Markdown notes keep the editor's default behaviour.
+
+- **Interception.** `WebHtmlEditor` filters the drag events of its `QWebEngineView` (and of the
+  render widget QtWebEngine creates inside it) before Chromium sees them: Chromium cannot read
+  Outlook's virtual files. `parse_drop` ([../src/horizon/attachment_drop.py](../src/horizon/attachment_drop.py))
+  decides on `DragEnter` whether the drop is ours; text, HTML, an image from a web page and drags
+  started inside Horizon (`source()` set) are left to CKEditor. On `Drop` the `QMimeData` is read
+  at once (it dies with the event), the page moves the caret under the cursor (`setCaretAt`), and
+  `content_dropped` is emitted **after** the drop returns — Outlook is still in its `DoDragDrop`
+  loop until then and must not be called back over COM.
+- **Archiving.** `DropImporter` stores files in `attachments` (BLOB, max 200 MB,
+  [../src/horizon/attachment.py](../src/horizon/attachment.py)); `.png/.jpg/.gif/.webp` go to
+  `images` and become ordinary images. E-mails dragged from Outlook only announce names
+  (`FileGroupDescriptorW`); their content is read over COM from the active Outlook window's
+  selection (`Selection` for messages, saved as `.msg`; `AttachmentSelection` for attachments of an
+  e-mail). Classic Outlook must be running — it is never launched, and the new Outlook has no COM.
+  `.eml` files are parsed with the stdlib; a `.msg` from disk gets its metadata through Outlook when
+  it is open.
+- **Display.** The `HorizonAttachment` plugin ([../web/src/wysiwyg.js](../web/src/wysiwyg.js))
+  stores `<figure class="horizon-attachment" data-kind="file|email|link" data-display="icon|preview"
+  data-attachment-id="N" …>`; the `data-*` attributes are authoritative, the inner HTML is a plain
+  fallback (link, subject, excerpt) that also feeds the search index. The display is chosen by type
+  — PDF and e-mails as a preview, other files as an icon card, URLs as a link card — and switched
+  from the block's toolbar (Ouvrir, Enregistrer sous…, Icône, Aperçu). PDF pages (first 5) are
+  rendered on demand by `_AttachmentSchemeHandler` from `horizon-attachment://N?page=P`
+  ([../src/horizon/attachment_preview.py](../src/horizon/attachment_preview.py)), nothing is stored.
+- **Opening.** Double-click or `Ouvrir` writes the archived copy to `%TEMP%\Horizon\attachments\<id>\`
+  and opens it with the associated application; edits to that copy do not come back.
+- **Link titles.** The browser's title (`text/x-moz-url`, HTML anchor) is used when present;
+  otherwise the card shows the host and `fetch_page_title` fetches `<title>` in a background thread,
+  then `setLinkTitle` updates cards still showing the placeholder.
+
+Attachments are not deleted when their block is removed: note versions may still reference them.
+
 ---
 
 ## HTTP API
